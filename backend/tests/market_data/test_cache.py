@@ -73,6 +73,55 @@ def test_update_with_reference_price_but_no_kind_defaults_to_prev_close(
     assert entry.reference_kind == ReferenceKind.PREV_CLOSE
 
 
+def test_repeated_identical_price_does_not_advance_updated_at_or_history(
+    price_cache: PriceCache,
+) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update("AAPL", 190.0, now=100.5)
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.updated_at == 100.0  # unchanged: no real price change
+    assert len(entry.history) == 1  # no duplicate point appended
+    assert entry.price == 190.0
+    assert entry.prev_price == 190.0
+    assert entry.status == TickerStatus.OK
+
+
+def test_repeated_identical_price_across_multiple_calls_appends_once(
+    price_cache: PriceCache,
+) -> None:
+    price_cache.update("AAPL", 190.0, now=1.0)
+    price_cache.update("AAPL", 190.0, now=2.0)
+    price_cache.update("AAPL", 190.0, now=3.0)
+    price_cache.update("AAPL", 191.0, now=4.0)  # a real change, after the repeats
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert len(entry.history) == 2  # only the two distinct prices
+    assert [p.price for p in entry.history] == [190.0, 191.0]
+    assert entry.updated_at == 4.0
+
+
+def test_repeated_identical_price_still_adopts_late_arriving_reference(
+    price_cache: PriceCache,
+) -> None:
+    # The simulator ticks first with no reference yet, then Massive-style data
+    # supplies a prev_close later at the same price — updated_at/history must
+    # stay frozen, but the reference is not a "tick" and should still land.
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update(
+        "AAPL", 190.0, reference_price=188.5, reference_kind=ReferenceKind.PREV_CLOSE, now=101.0
+    )
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.updated_at == 100.0
+    assert len(entry.history) == 1
+    assert entry.reference_price == 188.5
+    assert entry.reference_kind == ReferenceKind.PREV_CLOSE
+
+
 def test_drop_untracked_removes_missing_tickers(price_cache: PriceCache) -> None:
     price_cache.update("AAPL", 190.0, now=1.0)
     price_cache.update("MSFT", 420.0, now=1.0)

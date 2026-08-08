@@ -58,15 +58,25 @@ class PriceCache:
         If `reference_price` is omitted, the entry keeps its existing
         reference (or, on first tick, adopts `price` itself as a
         session-open reference — see `_seed_reference`).
+
+        `updated_at` and `history` only advance on an actual price change —
+        this is the invariant the SSE stream's diffing relies on ("emit only
+        when `updated_at` has advanced"). A repeated identical price (common
+        at low-priced tickers' diffusive step sizes, or a Massive poll that
+        echoes the same last trade) still refreshes `status`/reference data
+        but must not manufacture a fake tick.
         """
         now = now if now is not None else time.time()
         entry = self.ensure_tracked(ticker)
 
+        price_changed = entry.price is None or entry.price != price
+
         entry.prev_price = entry.price if entry.price is not None else price
         entry.price = price
         entry.status = TickerStatus.OK
-        entry.updated_at = now
-        entry.history.append(PricePoint(t=now, price=price))
+        if price_changed:
+            entry.updated_at = now
+            entry.history.append(PricePoint(t=now, price=price))
 
         if reference_price is not None:
             entry.reference_price = reference_price
