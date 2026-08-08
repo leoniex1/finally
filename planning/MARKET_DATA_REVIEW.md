@@ -20,8 +20,9 @@ lifespan wiring described in `market-data-design.md` §11–§13 don't exist yet
 that's explicitly a different module's concern per §1, but worth flagging so it isn't assumed done).
 
 **Status: ALL FINDINGS RESOLVED (2026-08-08).** Finding #1 was fixed first; Findings #2, #3, and
-the actionable part of #4 were closed in a follow-up pass. See "Resolution" and "Resolution —
-follow-up pass" below.
+the actionable part of #4 were closed in a follow-up pass; a third pass closed the in-scope items
+from that pass's own "remaining limitations" list. See the Resolution sections and the
+**Final Status Table** below.
 
 ## Test Results (original review)
 
@@ -298,15 +299,9 @@ can point the tracked set at a temporary database); the lifespan constructs the 
 `TrackedSetProvider`, and provider, publishes the cache on `app.state.price_cache`, starts the
 driver under `run_supervised`, and on shutdown cancels the task and then awaits `provider.aclose()`.
 
-**The one deliberate gap.** `PLAN.md` §7 requires schema/seed to exist before any background task
-runs, and design §11 shows `await init_db(settings.db_path)` as the first statement in the
-lifespan. `backend/app/db/` is owned by the database module's design doc and still does not exist,
-so that call is not present — its exact insertion point is marked with a comment block in
-`lifespan()`. Until it lands, running the app against a database with no `watchlist`/`positions`
-tables degrades to "prices stop updating," not "the app fails to start": `TrackedSetProvider.get()`
-raises, `run_supervised` logs it and retries with backoff, and the HTTP surface serves normally.
-That behavior is asserted by `test_startup_survives_a_database_with_no_tables` rather than left to
-chance. Adding the DB module is a one-line change to `main.py`.
+**The one gap left open by this pass** — `init_db()` not being called — was closed in the third
+pass below. At the time of this pass the lifespan carried a marked comment where the call belonged,
+and a schema-less database degraded to "prices stop updating" rather than a failed startup.
 
 **Supporting changes:** `Settings` gained `db_path` (env var `DB_PATH`, default `db/finally.db`),
 matching design §10 — the lifespan needs it to construct the `TrackedSetProvider`. `fastapi` and
@@ -333,11 +328,11 @@ matching design §10 — the lifespan needs it to construct the `TrackedSetProvi
   reporting, `200`/`[]` for a pending ticker, case normalization, the `HISTORY_MAXLEN` cap with
   correct eviction ends, duplicate prices not consuming buffer slots, and a dropped ticker
   reverting to `404`.
-- `backend/tests/market_data/test_main.py` (11 tests) — route registration, injected settings, the
-  pre-startup cache placeholder, the lifespan actually populating the cache from a seeded database
-  and the routes reading that same instance, provider selection by `MASSIVE_API_KEY` through the
-  real lifespan, startup surviving a schema-less database, shutdown closing both provider kinds,
-  and no driver task surviving shutdown.
+- `backend/tests/market_data/test_main.py` — route registration, injected settings, the
+  pre-startup cache placeholder, the lifespan actually populating the cache and the routes reading
+  that same instance, provider selection by `MASSIVE_API_KEY` through the real lifespan, shutdown
+  closing both provider kinds, and no driver task surviving shutdown. (Extended in the third pass
+  to 15 tests.)
 
 ### Finding #4 — CI now runs the backend suite
 
@@ -352,72 +347,247 @@ warnings at all.
 The first Finding #4 bullet (`TrackedSetProvider` opening a fresh connection per cycle) was
 deliberately left alone — it remains the documented simplicity-over-throughput tradeoff.
 
+## Resolution — third pass (2026-08-08) — limitations triaged and closed
+
+The second pass closed every numbered finding but left a "Remaining Limitations" list. Each item on
+it was re-examined and sorted into **in scope for Market Data Backend readiness** (implemented
+here) or **genuinely out of scope** (documented and deferred, with the reason).
+
+### In scope — implemented
+
+#### `init_db()` is now called from the lifespan
+
+**Verdict: in scope, and the most consequential item on the list.** The reasoning that had deferred
+it — "`app/db/` belongs to the database module's design doc" — confused *who owns the queries* with
+*who owns startup*. Three things settle it:
+
+- The market data subsystem cannot function at all without `watchlist` and `positions`.
+  `TrackedSetProvider` reads them on the driver's first cycle, so a fresh checkout produced an app
+  that crash-looped its only price feed forever.
+- `PLAN.md` §7 does not defer the schema to a later module — it specifies it completely (all six
+  tables, columns, constraints, and the seed data) and requires it in the lifespan "before any
+  background task is launched or any request is served."
+- `market-data-design.md` §14 lists `init_db()` → `build_market_data_provider()` →
+  `run_supervised(...)` as a **startup integration point of this subsystem**, and `PLAN.md` §12's
+  backend test bullet "schema exists and is seeded before background tasks run — the snapshot task
+  never sees a missing table" is untestable without it.
+
+A partial schema (just the two tables market data reads) was rejected: `PLAN.md` §7 explicitly
+promises "No separate migration step," and shipping half the tables would force exactly that on
+whoever adds the portfolio module.
+
+**New files:**
+
+| File | Contents |
+|---|---|
+| `backend/app/db/schema.sql` | All six tables from `PLAN.md` §7 — `users_profile`, `watchlist`, `positions`, `trades`, `portfolio_snapshots`, `chat_messages` — plus the `(user_id, recorded_at)` index on snapshots. Every statement is `IF NOT EXISTS`, so re-applying it on each startup is the "no migration step" mechanism. |
+| `backend/app/db/init.py` | `init_db(db_path, user_id="default")`: creates the parent directory, applies the schema, and seeds on a fresh database. |
+| `backend/app/db/__init__.py` | Re-exports `init_db`, `DEFAULT_WATCHLIST`, `DEFAULT_CASH_BALANCE`. |
+
+`await init_db(settings.db_path)` is now the first statement in `lifespan()`, before the cache,
+provider, and supervised task are constructed.
+
+Two decisions worth recording:
+
+- **Seeding is gated on the user-profile row, not on the watchlist being empty.** A user who
+  deliberately removes all ten default tickers must not have them silently restored on the next
+  restart. A brand-new database (or fresh Docker volume) has no profile row and gets both the
+  $10,000 balance and the default watchlist; an existing one is left exactly as the user left it.
+  Asserted by `test_restart_preserves_user_changes`.
+- **Seed inserts use `INSERT OR IGNORE`.** A database can legitimately hold watchlist rows without
+  a profile row (an earlier partial run, a test fixture). Colliding with the `(user_id, ticker)`
+  unique constraint must not take startup down.
+
+The schema also carries the `CHECK` constraints `PLAN.md` implies but does not spell out as DDL —
+`side IN ('buy','sell')` on `trades` and `role IN ('user','assistant')` on `chat_messages` — so the
+enum discipline `PLAN.md` §9 requires of the LLM's structured output is enforced at the storage
+layer too, not only in Pydantic.
+
+**Tests:** `backend/tests/market_data/test_db_init.py` (13 tests) — every table present, the
+snapshot index created, parent directories created, the `positions` uniqueness and `trades.side`
+constraints actually enforced, $10,000 seeded, the ten `PLAN.md` tickers seeded and matching the
+plan verbatim, unique row ids, running twice not duplicating anything, user changes surviving a
+restart, existing rows surviving a schema re-apply, and `user_id` isolation.
+
+`test_main.py` gained the startup-ordering coverage this unblocks:
+`test_startup_creates_and_seeds_a_database_that_does_not_exist` (a path that does not exist becomes
+a working, streaming app), `test_the_driver_never_sees_a_missing_table` (asserts **zero** warnings
+are logged by the driver or supervisor during startup — a single one would mean the ordering
+guarantee had regressed), and `test_startup_stays_alive_if_the_schema_disappears_at_runtime`, which
+drops a table *after* startup and confirms the app keeps serving. That last one deliberately
+preserves the resilience property the now-obsolete `test_startup_survives_a_database_with_no_tables`
+used to cover, so closing the gap did not cost coverage.
+
+#### `GET /api/health`
+
+**Verdict: system-level, not market data — but in scope for this branch.** `PLAN.md` §8 files it
+under "System," so it is not part of the market data subsystem proper. It is included here because
+this branch introduced the app shell (`main.py`) that owns it, it is fully specified, it has zero
+coupling to market data, and leaving it out would keep the Docker/deployment healthcheck blocked on
+a five-line endpoint.
+
+Deliberately shallow: it reports that the process is up and serving, and does **not** probe the
+database or the price cache. A health check that fails while the app is still serving would turn a
+transient condition the supervisor is designed to ride out into a container restart loop.
+
+Covered by `test_health_endpoint_reports_ok` and `test_health_endpoint_is_registered`.
+
+#### Massive base URL and snapshot path — the "unverified" claim was wrong
+
+**Verdict: not a limitation. The previous pass's claim was incorrect and is retracted.**
+
+The second pass carried forward "unverified against Massive's live docs" from
+`market-data-design.md` §8.2, which shows a placeholder host (`https://api.massive.example/v2`) and
+says "confirm against live Massive docs." That confirmation had **already been done** — in
+`MASSIVE_API.md`, a later and more specific document, researched against the official open-source
+client `massive-com/client-python`. `market-data-design.md` §8.2 is superseded on this point.
+
+Verified against the client repo, per `MASSIVE_API.md` §1, §2 and §5.1:
+
+| Implementation constant | Source of truth |
+|---|---|
+| `MASSIVE_BASE_URL = "https://api.massive.com"` | `massive/rest/__init__.py`'s `BASE`. Massive is the Polygon.io rebrand (2025-10-30); `api.polygon.io` is the legacy host. |
+| `SNAPSHOT_PATH = "/v2/snapshot/locale/us/markets/stocks/tickers"` | `RESTClient.get_snapshot_all("stocks", ...)` in `massive/rest/snapshot.py`. |
+| `Authorization: Bearer <key>` | `MASSIVE_API.md` §2 — the header, not the legacy `?apiKey=` query parameter. |
+| `?tickers=A,B,C` | §5.1's request shape. |
+| `lastTrade.p` → `price`, `prevDay.c` → `reference_price` (`prev_close`) | §5.1's field table, confirmed against the client's deserializer `massive/rest/models/snapshot.py`. |
+
+The implementation already matched all five exactly; no code change was needed. What was missing
+was a test proving it, so `test_massive_provider.py` gained:
+
+- `RECORDED_SNAPSHOT_RESPONSE`, the verbatim response from the official client's own test suite
+  (`test_rest/mocks/v2/snapshot/locale/us/markets/stocks/tickers/index.json`, reproduced in
+  `MASSIVE_API.md` §5.1) — kept complete, including the `min`/`fmv`/`todaysChangePerc` fields this
+  project ignores, so the parser is proven against the real wire shape.
+- `test_base_url_matches_the_official_client` and `test_snapshot_path_matches_the_official_client`,
+  which pin the two constants so a future edit cannot silently drift to the legacy host or to the
+  v3 unified snapshot (whose field names differ — `session`/`last_trade`, snake_case — and which
+  `MASSIVE_API.md` §5.3 warns must not be mixed with v2).
+- `test_fetch_parses_the_officially_recorded_response`, plus two mix-up guards the recorded fixture
+  alone cannot catch: in it `day.c` and `lastTrade.p` are coincidentally both `20.506`, so
+  `test_day_close_is_not_mistaken_for_the_last_trade_price` and
+  `test_bid_is_not_mistaken_for_the_last_trade_price` perturb those fields and assert the price
+  still comes from `lastTrade.p`.
+
+One genuinely unverified item remains, and it is operational rather than structural — see the
+deferred list below.
+
+### Out of scope — deferred, with reasons
+
+#### In-memory history is by design; unchanged
+
+`PLAN.md` §6 states it outright: the ring buffer "is in-memory only and is lost on restart — it
+exists to give the detail chart shape on page load, not to be a durable time series." §8 then
+specifies the endpoint's behavior on a cold start: "a fresh container returns few or no points —
+that is expected and the chart simply fills in from SSE." Persisting it would contradict the plan
+and duplicate `portfolio_snapshots`, which is the deliberately durable series. **No change made.**
+`test_pending_ticker_returns_200_with_no_points` pins the cold-start contract so it stays a `200`
+with `points: []` rather than drifting into an error.
+
+#### Playwright E2E stays deferred until the frontend exists
+
+`PLAN.md` §12 puts E2E in `test/` with a `docker-compose.test.yml` spinning up the app plus a
+Playwright container, and every listed scenario drives the UI — "default watchlist appears,"
+"prices flash green/red," "the position row disappears from both the table and the heatmap." None
+can be written against a backend with no frontend. The backend behaviors they would exercise are
+already covered at the unit/HTTP level here (fresh-start seeding, SSE reconnect snapshot, detail
+chart backfill, a held ticker staying tracked after watchlist removal). **Correctly deferred.**
+
+#### Massive plan-tier data freshness
+
+`MASSIVE_API.md` §8 flags, from search-summarized sources it could not fetch directly, that the
+free tier may be **end-of-day only** rather than merely rate-limited — meaning free-tier prices may
+look flat intraday. This changes no code (the polling loop, parsing, and unavailable-handling are
+identical whichever tier's data flows through them); it is an operational expectation to document
+next to `MASSIVE_API_KEY`. That belongs with the deployment/README work, not here. Note the repo
+also has no committed `.env.example` yet, which `PLAN.md` §4 calls for — the natural home for that
+note.
+
+#### `TrackedSetProvider`'s per-cycle connection
+
+Unchanged, as in the second pass: the documented simplicity-over-throughput tradeoff
+(`market-data-design.md` §5).
+
+## Final Status Table
+
+| # | Item | Status |
+|---|---|---|
+| Finding 1 | `PriceCache.update()` advancing `updated_at`/`history` on unchanged prices | **Resolved** — fixed in `cache.py`; verified by test run |
+| Finding 2 | SSE stream, history endpoint, FastAPI lifespan wiring absent | **Resolved** — implemented with 37 tests |
+| Finding 3 | No `aclose()` path for `MassiveProvider` | **Resolved** — `aclose()` on the base interface, called by the lifespan |
+| Finding 4a | `TrackedSetProvider` opens a connection per cycle | **Deferred by design** — documented tradeoff |
+| Finding 4b | `_as_finite_positive_float` guard | **No action** — noted as a strength |
+| Finding 4c | Per-sector shared event roll | **No action** — noted as a strength |
+| Finding 4d | No CI runs `backend/tests` | **Resolved** — `Backend Tests` workflow |
+| Limitation 1 | `init_db()` not called from the lifespan | **Resolved** — `app/db/` implemented and wired |
+| Limitation 2 | No `/api/health` | **Resolved** — added to the app shell (system-level, shipped with `main.py`) |
+| Limitation 3 | History buffer in-memory, lost on restart | **By design** — `PLAN.md` §6/§8; unchanged |
+| Limitation 4 | Massive base URL / snapshot path "unverified" | **Retracted** — already verified in `MASSIVE_API.md` against the official client; now test-pinned |
+| Limitation 5 | No Playwright E2E | **Deferred** — requires the frontend (`PLAN.md` §12) |
+| New | Massive free-tier data freshness | **Deferred** — operational note for README/`.env.example` |
+| New | No committed `.env.example` | **Deferred** — deployment module (`PLAN.md` §4) |
+
 ## Final Test Results
 
 ```
-cd backend && uv sync && uv run pytest tests/market_data -v
+cd backend && uv sync && uv run pytest -v
 ...
-123 passed in 12.21s
+145 passed in 16.65s
 ```
 
-Run on 2026-08-08 with `uv` on Windows (Python 3.12+, `uv sync --locked` clean). No warnings, no
-skips, no xfails.
+Run 2026-08-08 with `uv` on Windows (Python 3.13, `uv sync --locked` clean). No warnings, no skips,
+no xfails.
 
-| | Tests |
+| Source | Tests |
 |---|---|
 | Original review baseline | 69 |
 | Finding #1 fix (`test_cache.py`) | +6 → 75 |
 | Finding #3 (`test_provider_contract.py`) | +11 |
 | Finding #2 — SSE (`test_sse_stream.py`) | +17 |
 | Finding #2 — history endpoint (`test_history_endpoint.py`) | +9 |
-| Finding #2 — app/lifespan (`test_main.py`) | +11 |
-| **Total** | **123** |
+| Finding #2/#3 — app, lifespan, health (`test_main.py`) | +15 |
+| Third pass — database init (`test_db_init.py`) | +13 |
+| Third pass — Massive endpoint verification (`test_massive_provider.py`) | +5 |
+| **Total** | **145** |
 
-No existing test was weakened, skipped, or removed at any point; the 69 original tests all still
-pass unmodified.
+**No existing test was weakened, skipped, or removed at any point.** One test was *replaced* rather
+than deleted: `test_startup_survives_a_database_with_no_tables` asserted behavior that only existed
+because `init_db()` was missing. It became
+`test_startup_creates_and_seeds_a_database_that_does_not_exist` (the new correct behavior), and its
+resilience property was preserved and strengthened in
+`test_startup_stays_alive_if_the_schema_disappears_at_runtime`, which breaks the database *after*
+startup instead. The `seeded_db` fixture in `test_main.py` was simplified from a hand-rolled schema
+to a bare path, because the lifespan now creates the database itself — testing the app instead of a
+fixture.
 
 ### Manual end-to-end verification
 
-Beyond the suite, the assembled stack was run under `uvicorn` against a database seeded with the
-ten default watchlist tickers, confirming behavior the unit tests approximate:
+The assembled stack was run under `uvicorn` against a **completely fresh, non-existent** database
+path — the real first-run scenario:
 
-- `GET /api/prices/AAPL/history` returned a populated `points` array with `reference_kind:
-  "session_open"` and ~500ms spacing between points.
-- `GET /api/stream/prices` delivered the initial snapshot immediately on connect and then live
-  diffed updates, with `direction` flipping between `up`/`down`/`flat` and the full field set
-  specified in `PLAN.md` §6.
-- Against a database with **no** schema, the server still started and served, logging the driver's
-  restart-with-backoff rather than failing startup — the documented degradation described above.
-
-## Remaining Limitations
-
-These are known and intentional, not open defects:
-
-1. **`init_db()` is not called in the lifespan** because `backend/app/db/` does not exist yet. Its
-   insertion point is marked in `main.py`. Until the database module lands, a real run needs a
-   database that already has the `watchlist` and `positions` tables.
-2. **No `/api/health` endpoint.** `PLAN.md` §8 lists it under "System," not market data; it belongs
-   to the API-layer/app module.
-3. **The history buffer is in-memory and lost on restart** — by design (`PLAN.md` §6). A fresh
-   container serves `points: []` until ticks accumulate.
-4. **`MASSIVE_BASE_URL` and the snapshot path remain unverified against Massive's live docs**, as
-   `MASSIVE_API.md` §8.2 flags. `_quote_from_row` is the single parsing boundary that would change.
-5. **No E2E (Playwright) coverage yet** — `test/` per `PLAN.md` §12 is a later stage and needs the
-   frontend.
+- The parent directory and `finally.db` were created and seeded automatically; startup logged no
+  warnings or errors at all.
+- `GET /api/health` → `{"status": "ok"}`.
+- `GET /api/prices/NFLX/history` returned a populated `points` array with `reference_kind:
+  "session_open"` and ~500ms spacing — a chart with shape immediately, with no manual setup.
+- `GET /api/stream/prices` delivered the full ten-ticker snapshot on connect, then live diffed
+  updates with `direction` flipping between `up`/`down`/`flat` and the complete `PLAN.md` §6 field
+  set.
 
 ## Readiness for the Next Stage
 
-The market data subsystem now delivers everything `market-data-design.md` §1 says it owns: the
-tracked set, the shared cache, both interchangeable providers behind one interface, the SSE stream,
-the history endpoint, and supervised background execution. The integration surface other modules
-code against (design §14) is live and stable:
+The market data subsystem delivers everything `market-data-design.md` §1 assigns it: the tracked
+set, the shared cache, both interchangeable providers behind one interface, the SSE stream, the
+history endpoint, and supervised background execution. A fresh clone now runs to a working,
+streaming app with one command and no setup.
+
+The integration surface other modules code against (design §14) is live and stable:
 
 - `request.app.state.price_cache` → `cache.get(ticker)` for the trade executor's `409` rule and for
   portfolio valuation's `priced: false` fallback.
 - Watchlist `POST`/`DELETE` need no notification — `TrackedSetProvider` picks changes up on the next
   driver cycle.
-- The portfolio-snapshot task wires into `main.py`'s `tasks` list exactly like the driver does, with
-  the same `run_supervised` wrapper.
-
-The next stage — the database module and the portfolio/trade API — can proceed against these
-without changes here.
+- The portfolio-snapshot task wires into `main.py`'s `tasks` list exactly like the driver, with the
+  same `run_supervised` wrapper.
+- All six tables from `PLAN.md` §7 already exist and are seeded, so the portfolio, trade, and chat
+  modules can write against them without a migration or a schema change.
