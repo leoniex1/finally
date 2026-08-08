@@ -58,15 +58,29 @@ class PriceCache:
         If `reference_price` is omitted, the entry keeps its existing
         reference (or, on first tick, adopts `price` itself as a
         session-open reference — see `_seed_reference`).
+
+        `updated_at` and `history` only advance on a *real* observation: the
+        price actually differs from what's cached, or the ticker is newly
+        becoming available (first tick, or recovering from `pending`/
+        `unavailable`). An exact repeat of the current price while already
+        `ok` is a no-op for both — this is what makes the SSE contract
+        ("emit only when `updated_at` has advanced") hold, and keeps the
+        `history` ring buffer from filling up with duplicate observations
+        (GBM repeats the same rounded price often enough for this to matter
+        in practice, not just as a theoretical edge case).
         """
         now = now if now is not None else time.time()
         entry = self.ensure_tracked(ticker)
 
+        price_changed = entry.price is None or price != entry.price
+        newly_available = entry.status is not TickerStatus.OK
+
         entry.prev_price = entry.price if entry.price is not None else price
         entry.price = price
         entry.status = TickerStatus.OK
-        entry.updated_at = now
-        entry.history.append(PricePoint(t=now, price=price))
+        if price_changed or newly_available:
+            entry.updated_at = now
+            entry.history.append(PricePoint(t=now, price=price))
 
         if reference_price is not None:
             entry.reference_price = reference_price

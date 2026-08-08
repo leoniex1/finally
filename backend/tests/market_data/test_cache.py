@@ -73,6 +73,82 @@ def test_update_with_reference_price_but_no_kind_defaults_to_prev_close(
     assert entry.reference_kind == ReferenceKind.PREV_CLOSE
 
 
+def test_repeated_identical_price_does_not_advance_updated_at(price_cache: PriceCache) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update("AAPL", 190.0, now=101.0)  # exact repeat, later tick
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.updated_at == 100.0  # unchanged by the no-op repeat
+
+
+def test_repeated_identical_price_does_not_append_duplicate_history(price_cache: PriceCache) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update("AAPL", 190.0, now=101.0)
+    price_cache.update("AAPL", 190.0, now=102.0)
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert len(entry.history) == 1
+    assert entry.history[0].t == 100.0
+
+
+def test_repeated_identical_price_keeps_status_ok(price_cache: PriceCache) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update("AAPL", 190.0, now=101.0)
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.status == TickerStatus.OK
+    assert entry.price == 190.0
+
+
+def test_real_change_after_repeats_advances_updated_at_and_appends_history(
+    price_cache: PriceCache,
+) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.update("AAPL", 190.0, now=101.0)  # no-op repeat
+    price_cache.update("AAPL", 191.0, now=102.0)  # real change
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.updated_at == 102.0
+    assert len(entry.history) == 2
+    assert entry.prev_price == 190.0
+    assert entry.direction == "up"
+
+
+def test_repeated_price_still_allows_reference_update(price_cache: PriceCache) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)  # seeds session-open reference at 190.0
+    price_cache.update(
+        "AAPL",
+        190.0,
+        reference_price=188.5,
+        reference_kind=ReferenceKind.PREV_CLOSE,
+        now=101.0,
+    )
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.reference_price == 188.5
+    assert entry.reference_kind == ReferenceKind.PREV_CLOSE
+    assert entry.updated_at == 100.0  # still a no-op for the tick itself
+
+
+def test_recovering_from_unavailable_with_same_price_advances_updated_at(
+    price_cache: PriceCache,
+) -> None:
+    price_cache.update("AAPL", 190.0, now=100.0)
+    price_cache.mark_unavailable("AAPL")
+    price_cache.update("AAPL", 190.0, now=200.0)  # same price, but ticker is back
+
+    entry = price_cache.get("AAPL")
+    assert entry is not None
+    assert entry.status == TickerStatus.OK
+    assert entry.updated_at == 200.0  # status recovery is a real observation
+    assert len(entry.history) == 2
+
+
 def test_drop_untracked_removes_missing_tickers(price_cache: PriceCache) -> None:
     price_cache.update("AAPL", 190.0, now=1.0)
     price_cache.update("MSFT", 420.0, now=1.0)
