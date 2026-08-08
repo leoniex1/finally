@@ -31,6 +31,9 @@ class MassiveProvider(MarketDataProvider):
         )
 
     async def aclose(self) -> None:
+        """Close the shared HTTP client's connection pool. Overrides the
+        base class's no-op so the lifespan handler's provider-agnostic
+        `await provider.aclose()` actually releases these sockets."""
         await self._client.aclose()
 
     async def fetch(self, tickers: AbstractSet[str]) -> Mapping[str, Quote]:

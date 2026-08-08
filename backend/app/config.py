@@ -11,12 +11,16 @@ import os
 from dataclasses import dataclass
 
 DEFAULT_MASSIVE_POLL_INTERVAL_SECONDS = 15.0
+DEFAULT_DB_PATH = "db/finally.db"
 
 
 @dataclass(frozen=True)
 class Settings:
     massive_api_key: str = ""
     massive_poll_interval_seconds: float = DEFAULT_MASSIVE_POLL_INTERVAL_SECONDS
+    #: Where the SQLite file lives. `TrackedSetProvider` reads the watchlist
+    #: and positions tables from it every driver cycle (`PLAN.md` §6, §11).
+    db_path: str = DEFAULT_DB_PATH
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -28,6 +32,7 @@ class Settings:
                     str(DEFAULT_MASSIVE_POLL_INTERVAL_SECONDS),
                 )
             ),
+            db_path=os.environ.get("DB_PATH", DEFAULT_DB_PATH),
         )
 
     @property
