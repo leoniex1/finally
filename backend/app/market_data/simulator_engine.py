@@ -57,14 +57,43 @@ class SimulatorEngine:
         new prices. Assumes `sync_tracked(tickers)` has already been called
         this cycle."""
         sector_factors = {s: self._rng.gauss(0, 1) for s in SECTORS}
-        return {ticker: self._step_one(ticker, sector_factors) for ticker in tickers}
+        sector_events = {s: self._roll_sector_event() for s in SECTORS}
+        return {
+            ticker: self._step_one(ticker, sector_factors, sector_events) for ticker in tickers
+        }
 
     def _seed(self, ticker: str) -> None:
         spec = spec_for(ticker)
         self._specs[ticker] = spec
         self._prices[ticker] = spec.price
 
-    def _step_one(self, ticker: str, sector_factors: dict[str, float]) -> float:
+    def _roll_sector_event(self) -> float | None:
+        """One shared roll per sector per tick, mirroring `sector_factors`.
+
+        A ticker-independent roll (the original design) fires ~10 times per
+        ticker over a 5,000-tick window; since a single 2-5% jump carries
+        ~250x the variance of a normal diffusive tick, those independent
+        per-ticker jumps dominate tick-to-tick variance and drown out the
+        sector-correlated diffusion signal entirely. Sharing one roll across
+        every ticker in the sector — same news, same tick — keeps each
+        ticker's own event frequency at `EVENT_PROBABILITY` (unchanged from
+        `PLAN.md`/`MARKET_SIMULATOR.md` §2.4) while making the jump itself
+        move sector-mates together, consistent with §2.3's "tech stocks move
+        together" instead of fighting it.
+        """
+        if self._rng.random() >= EVENT_PROBABILITY:
+            return None
+        pct = self._rng.uniform(EVENT_MIN_PCT, EVENT_MAX_PCT)
+        if self._rng.random() < 0.5:
+            pct = -pct
+        return pct
+
+    def _step_one(
+        self,
+        ticker: str,
+        sector_factors: dict[str, float],
+        sector_events: dict[str, float | None],
+    ) -> float:
         spec = self._specs[ticker]
         price = self._prices[ticker]
 
@@ -76,11 +105,9 @@ class SimulatorEngine:
         diffusion = spec.sigma * (dt**0.5) * z
         new_price = price * math.exp(drift + diffusion)
 
-        if self._rng.random() < EVENT_PROBABILITY:
-            pct = self._rng.uniform(EVENT_MIN_PCT, EVENT_MAX_PCT)
-            if self._rng.random() < 0.5:
-                pct = -pct
-            new_price *= 1 + pct
+        event_pct = sector_events[spec.sector]
+        if event_pct is not None:
+            new_price *= 1 + event_pct
 
         new_price = max(round(new_price, 2), MIN_PRICE)
         self._prices[ticker] = new_price
