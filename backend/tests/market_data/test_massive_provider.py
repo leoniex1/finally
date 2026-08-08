@@ -121,6 +121,104 @@ async def test_fetch_skips_malformed_rows() -> None:
 
 
 @respx.mock
+async def test_fetch_skips_row_with_non_numeric_price() -> None:
+    respx.get(f"{MASSIVE_BASE_URL}{SNAPSHOT_PATH}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "tickers": [
+                    {"ticker": "AAPL", "lastTrade": {"p": "not-a-number"}},
+                    {"ticker": "MSFT", "lastTrade": {"p": 420.0}},
+                ],
+            },
+        )
+    )
+    provider = MassiveProvider(api_key="test-key")
+
+    # A malformed individual field must not raise out of fetch() — it's
+    # exactly the "malformed row" case fetch() is contracted to swallow,
+    # not a whole-request failure.
+    quotes = await provider.fetch({"AAPL", "MSFT"})
+
+    assert set(quotes) == {"MSFT"}
+
+    await provider.aclose()
+
+
+@respx.mock
+async def test_fetch_skips_row_with_non_positive_price() -> None:
+    respx.get(f"{MASSIVE_BASE_URL}{SNAPSHOT_PATH}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "tickers": [
+                    {"ticker": "AAPL", "lastTrade": {"p": 0.0}},
+                    {"ticker": "TSLA", "lastTrade": {"p": -5.0}},
+                    {"ticker": "MSFT", "lastTrade": {"p": 420.0}},
+                ],
+            },
+        )
+    )
+    provider = MassiveProvider(api_key="test-key")
+
+    # A zero or negative price must never reach the cache — PLAN.md §8's
+    # "free shares" failure mode requires trades never fill at price <= 0.
+    quotes = await provider.fetch({"AAPL", "TSLA", "MSFT"})
+
+    assert set(quotes) == {"MSFT"}
+
+    await provider.aclose()
+
+
+@respx.mock
+async def test_fetch_skips_row_with_non_finite_price() -> None:
+    respx.get(f"{MASSIVE_BASE_URL}{SNAPSHOT_PATH}").mock(
+        return_value=httpx.Response(
+            200,
+            content=b'{"status": "OK", "tickers": '
+            b'[{"ticker": "AAPL", "lastTrade": {"p": NaN}}]}',
+            headers={"Content-Type": "application/json"},
+        )
+    )
+    provider = MassiveProvider(api_key="test-key")
+
+    quotes = await provider.fetch({"AAPL"})
+
+    assert quotes == {}
+
+    await provider.aclose()
+
+
+@respx.mock
+async def test_fetch_omits_reference_for_malformed_prev_close_but_keeps_price() -> None:
+    respx.get(f"{MASSIVE_BASE_URL}{SNAPSHOT_PATH}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "tickers": [
+                    {"ticker": "AAPL", "lastTrade": {"p": 190.12}, "prevDay": {"c": "n/a"}},
+                ],
+            },
+        )
+    )
+    provider = MassiveProvider(api_key="test-key")
+
+    quotes = await provider.fetch({"AAPL"})
+
+    # The price is still usable even though prevDay.c is garbage — the
+    # provider just omits the reference and lets the cache's own
+    # session-open seeding take over, rather than dropping the whole ticker.
+    assert quotes["AAPL"].price == 190.12
+    assert quotes["AAPL"].reference_price is None
+    assert quotes["AAPL"].reference_kind is None
+
+    await provider.aclose()
+
+
+@respx.mock
 async def test_fetch_propagates_whole_request_failures() -> None:
     respx.get(f"{MASSIVE_BASE_URL}{SNAPSHOT_PATH}").mock(
         return_value=httpx.Response(500, json={"status": "ERROR"})
