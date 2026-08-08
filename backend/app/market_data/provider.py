@@ -58,3 +58,21 @@ class MarketDataProvider(ABC):
         produced nothing usable, try again next cycle".
         """
         raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """
+        Release any resources the provider holds (HTTP connection pools,
+        sockets). Called once at application shutdown, after the driver
+        task has been cancelled.
+
+        Deliberately concrete-with-a-no-op-default rather than abstract: a
+        provider like `SimulatorProvider` owns nothing to release, and
+        forcing every implementation to write an empty override buys
+        nothing. Making it part of the base interface is what lets the
+        lifespan handler (`app/main.py`) shut *any* provider down with a
+        plain `await provider.aclose()`, instead of an
+        `isinstance(provider, MassiveProvider)` special case that would
+        silently leak the client's connection pool the day a third source
+        is added.
+        """
+        return None
