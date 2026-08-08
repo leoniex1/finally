@@ -106,14 +106,33 @@ keeping meaningful idiosyncratic noise — this is a tuning choice (§7), not a 
 
 ### 2.4 Event jumps
 
-Independently of the GBM step, each ticker has a small per-tick probability of an extra
-multiplicative jump, layered on top of that tick's diffusive move:
+Independently of the GBM step, each **sector** has a small per-tick probability of an extra
+multiplicative jump, layered on top of that tick's diffusive move, shared by every currently
+tracked ticker in that sector — the same mechanism §2.3 uses for `Z_sector`, applied to jumps
+instead of diffusion:
 
 ```
-if random() < EVENT_PROBABILITY:
+if random() < EVENT_PROBABILITY:            # rolled once per sector, per tick
     pct ~ Uniform(EVENT_MIN_PCT, EVENT_MAX_PCT), sign chosen 50/50
-    price *= (1 + pct)
+    for ticker in tickers_in(sector):
+        price[ticker] *= (1 + pct)
 ```
+
+Because the roll is per-sector rather than per-ticker, a single ticker still sees a jump at the
+same `EVENT_PROBABILITY` rate as before (it belongs to exactly one sector) — so "roughly every 4
+minutes" (below) is unchanged from a given ticker's point of view. What changes is that sector-mates
+now jump *together*, on the same tick, by the same percentage — modeling sector-wide news (a rate
+decision moving every bank stock, an export ban moving every chip stock) rather than pure
+company-specific noise.
+
+This isn't cosmetic: a 2–5% jump is roughly 200–500x larger than a single diffusive tick at this
+`dt` (§2.2), so whenever an event fires it dominates that ticker's tick-to-tick variance. If jumps
+were rolled independently per ticker, those large, uncorrelated jumps would swamp the much smaller
+correlated diffusion signal from §2.3 in any tick-level measurement (e.g. sample correlation of
+returns over thousands of ticks) — the sector co-movement the whole mechanism exists to produce
+would be statistically undetectable despite being implemented correctly. Sharing the roll per
+sector fixes this at the source: the dominant-variance component now carries the correlation
+signal instead of erasing it.
 
 At `EVENT_PROBABILITY = 0.002` and a 500ms tick, a given ticker gets a 2–5% jump roughly every
 `1 / 0.002 = 500` ticks ≈ **4 minutes**, which is frequent enough that a demo running for a few
@@ -258,14 +277,32 @@ class SimulatorEngine:
         Assumes `sync_tracked(tickers)` has already been called this cycle (the
         `SimulatorProvider` in MARKET_INTERFACE.md §4.1 always does both together)."""
         sector_factors = {s: self._rng.gauss(0, 1) for s in SECTORS}
-        return {ticker: self._step_one(ticker, sector_factors) for ticker in tickers}
+        sector_events = {s: self._roll_sector_event() for s in SECTORS}
+        return {
+            ticker: self._step_one(ticker, sector_factors, sector_events) for ticker in tickers
+        }
 
     def _seed(self, ticker: str) -> None:
         spec = spec_for(ticker)
         self._specs[ticker] = spec
         self._prices[ticker] = spec.price
 
-    def _step_one(self, ticker: str, sector_factors: dict[str, float]) -> float:
+    def _roll_sector_event(self) -> float | None:
+        """One shared roll per sector, per tick — every tracked ticker in that
+        sector gets the same jump (or none) this tick (§2.4)."""
+        if self._rng.random() >= EVENT_PROBABILITY:
+            return None
+        pct = self._rng.uniform(EVENT_MIN_PCT, EVENT_MAX_PCT)
+        if self._rng.random() < 0.5:
+            pct = -pct
+        return pct
+
+    def _step_one(
+        self,
+        ticker: str,
+        sector_factors: dict[str, float],
+        sector_events: dict[str, float | None],
+    ) -> float:
         spec = self._specs[ticker]
         price = self._prices[ticker]
 
@@ -277,11 +314,9 @@ class SimulatorEngine:
         diffusion = spec.sigma * (dt ** 0.5) * z
         new_price = price * pow(2.718281828459045, drift + diffusion)
 
-        if self._rng.random() < EVENT_PROBABILITY:
-            pct = self._rng.uniform(EVENT_MIN_PCT, EVENT_MAX_PCT)
-            if self._rng.random() < 0.5:
-                pct = -pct
-            new_price *= 1 + pct
+        event_pct = sector_events[spec.sector]
+        if event_pct is not None:
+            new_price *= 1 + event_pct
 
         new_price = max(round(new_price, 2), MIN_PRICE)
         self._prices[ticker] = new_price
@@ -297,6 +332,12 @@ Design notes:
 - **`sector_factors` is drawn once per `step()` call, shared across every ticker passed in that
   call** — this is the entire correlation mechanism (§2.3) in three lines. No pairwise
   correlation matrix, no per-ticker bookkeeping beyond "which sector am I in."
+- **`sector_events` is rolled the same way, once per `step()` call, shared across every ticker in
+  that sector** (§2.4) — the same "one shared draw per sector" pattern as `sector_factors`, applied
+  to jumps instead of diffusion. This is required, not stylistic symmetry: at this `dt`, a single
+  event jump carries far more variance than a tick of diffusion, so an *independent* per-ticker
+  roll would make uncorrelated jump noise dominate tick-to-tick returns and mask the §2.3
+  correlation entirely — see the empirical test in §7.
 - **A newly tracked ticker is seeded the moment it's first passed to `sync_tracked`,** and its
   very first `step()` call afterward already produces a real GBM-evolved price (not the bare seed
   price) — this satisfies "starts ticking on its next cycle" from `PLAN.md` §6 exactly, since the
@@ -374,7 +415,11 @@ Ties directly to the simulator-specific items in `PLAN.md` §12:
   tick-to-tick returns have materially higher sample correlation than either has with the
   different-sector ticker. A fixed seed makes this a reproducible, non-flaky assertion.
   Known example: `SeedSpec` sectors already put AAPL/GOOGL/MSFT/AMZN/NVDA/META all in `"tech"` —
-  a real test can use exactly this pair without inventing new fixtures.
+  a real test can use exactly this pair without inventing new fixtures. This assertion only holds
+  because event jumps are rolled per-sector (§2.4), not per-ticker: with a per-ticker roll, the
+  independent jumps dominate tick-level variance and the measured correlation collapses to
+  ~0 regardless of how strongly `sector_factors` correlates the diffusion term — this is the
+  entire reason `sector_events` exists.
 - **Event jumps fire at roughly the configured rate**: over a large number of steps for one
   ticker with a fixed seed, count ticks where `abs(step_return) > EVENT_MIN_PCT` (a proxy for "an
   event fired that tick," since a pure-diffusion tick at this `dt` essentially never produces a
