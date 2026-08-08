@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from .api.routes import market_data as market_data_routes
 from .config import Settings
+from .db.init import init_db
 from .market_data.cache import PriceCache
 from .market_data.driver import run_market_data_loop
 from .market_data.factory import build_market_data_provider
@@ -36,6 +37,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     # the lifespan has run gets an empty cache rather than an AttributeError.
     app.state.price_cache = PriceCache()
     app.include_router(market_data_routes.router)
+
+    @app.get("/api/health")
+    async def health() -> dict:
+        """Liveness check for Docker/deployment (`PLAN.md` §8, System).
+
+        Deliberately shallow: it reports that the process is up and serving,
+        nothing more. It must not probe the database or the price cache — a
+        health check that fails while the app is still serving requests
+        would make a container restart loop out of a transient condition
+        the supervisor is already designed to ride out.
+        """
+        return {"status": "ok"}
+
     return app
 
 
@@ -54,12 +68,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
 
     # ── Database ─────────────────────────────────────────────────────────
-    # `app/db/` (schema + seed) is owned by the database module's design
-    # doc and does not exist yet. Its `await init_db(settings.db_path)` call
-    # belongs HERE — before the tasks below start. Until it lands, a run
-    # against a database with no `watchlist`/`positions` tables makes
-    # `TrackedSetProvider.get()` raise; `run_supervised` catches that, logs
-    # it, and retries with backoff, so the app still starts and serves.
+    # First, and awaited: the driver loop below queries `watchlist` and
+    # `positions` on its very first cycle without waiting for a request, so
+    # deferring this to the first request would leave a background task
+    # hitting tables that do not exist yet.
+    await init_db(settings.db_path)
 
     cache = PriceCache()
     tracked_set = TrackedSetProvider(settings.db_path)

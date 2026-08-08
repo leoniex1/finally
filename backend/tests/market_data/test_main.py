@@ -9,7 +9,8 @@ before the schema exists — plus the shutdown path that Finding #3 of
 from __future__ import annotations
 
 import asyncio
-import uuid
+import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -18,47 +19,22 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.db.init import DEFAULT_CASH_BALANCE, DEFAULT_WATCHLIST
 from app.main import create_app
 from app.market_data.cache import PriceCache
 from app.market_data.massive_provider import MassiveProvider
 from app.market_data.models import TickerStatus
 from app.market_data.simulator_provider import SimulatorProvider
 
-SCHEMA = """
-CREATE TABLE watchlist (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    ticker TEXT NOT NULL,
-    added_at TEXT,
-    UNIQUE (user_id, ticker)
-);
-
-CREATE TABLE positions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    ticker TEXT NOT NULL,
-    quantity REAL NOT NULL,
-    avg_cost REAL,
-    updated_at TEXT,
-    UNIQUE (user_id, ticker)
-);
-"""
-
-
 @pytest.fixture
-async def seeded_db(tmp_path) -> str:
-    """A database shaped like the one `app/db/` will create, seeded with a
-    couple of watchlist rows so the driver has something to price."""
-    path = str(tmp_path / "finally-test.db")
-    async with aiosqlite.connect(path) as db:
-        await db.executescript(SCHEMA)
-        for ticker in ("AAPL", "MSFT"):
-            await db.execute(
-                "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, ?, ?, ?)",
-                (str(uuid.uuid4()), "default", ticker, "2026-01-01T00:00:00"),
-            )
-        await db.commit()
-    return path
+def seeded_db(tmp_path) -> str:
+    """A path for a database the lifespan will create and seed itself.
+
+    The file deliberately does not exist yet: `init_db()` running inside
+    the lifespan is the thing under test, so pre-creating a schema here
+    would test a fixture instead of the app.
+    """
+    return str(tmp_path / "finally-test.db")
 
 
 def _settings(db_path: str, **overrides) -> Settings:
@@ -128,7 +104,9 @@ async def test_lifespan_starts_the_driver_and_populates_the_cache(seeded_db: str
 
     async with running_app(app) as client:
         cache: PriceCache = app.state.price_cache
-        assert await _wait_until(lambda: {e.ticker for e in cache.snapshot()} == {"AAPL", "MSFT"})
+        assert await _wait_until(
+            lambda: {e.ticker for e in cache.snapshot()} == set(DEFAULT_WATCHLIST)
+        )
         assert all(e.status is TickerStatus.OK for e in cache.snapshot())
 
         # And the routes read that same live cache instance.
@@ -164,15 +142,91 @@ async def test_lifespan_selects_massive_with_an_api_key(seeded_db: str) -> None:
         assert isinstance(app.state.market_data_provider, MassiveProvider)
 
 
-async def test_startup_survives_a_database_with_no_tables(tmp_path) -> None:
-    """Until `app/db/` lands, a missing schema must degrade to "prices stop
-    updating", not "the app fails to start" — `run_supervised` absorbs the
-    driver's exception and retries with backoff."""
-    app = create_app(_settings(str(tmp_path / "empty.db")))
+async def test_startup_creates_and_seeds_a_database_that_does_not_exist(tmp_path) -> None:
+    """`PLAN.md` §7/§12: the schema exists and is seeded before the driver
+    runs. A fresh Docker volume must come up as a working app with the ten
+    default tickers already streaming — no manual setup, no first-request
+    deferral."""
+    db_path = str(tmp_path / "fresh" / "finally.db")
+    app = create_app(_settings(db_path))
 
     async with running_app(app) as client:
-        # The app serves; the untracked ticker just 404s.
-        assert (await client.get("/api/prices/AAPL/history")).status_code == 404
+        assert os.path.exists(db_path)
+
+        cache: PriceCache = app.state.price_cache
+        assert await _wait_until(
+            lambda: {e.ticker for e in cache.snapshot()} == set(DEFAULT_WATCHLIST)
+        )
+
+        response = await client.get("/api/prices/NVDA/history")
+        assert response.status_code == 200
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT cash_balance FROM users_profile WHERE id = 'default'")
+        assert (await cursor.fetchone())[0] == DEFAULT_CASH_BALANCE
+
+
+async def test_the_driver_never_sees_a_missing_table(tmp_path) -> None:
+    """The ordering guarantee, asserted directly: `init_db` completes before
+    the driver's first cycle, so the tracked-set query never runs against a
+    schema-less database. A single logged failure here would mean startup
+    order had regressed."""
+    records: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = Capture(level=logging.WARNING)
+    supervisor_log = logging.getLogger("market_data.supervisor")
+    driver_log = logging.getLogger("market_data.driver")
+    supervisor_log.addHandler(handler)
+    driver_log.addHandler(handler)
+    try:
+        app = create_app(_settings(str(tmp_path / "fresh.db")))
+        async with running_app(app):
+            cache: PriceCache = app.state.price_cache
+            assert await _wait_until(lambda: len(cache.snapshot()) == len(DEFAULT_WATCHLIST))
+    finally:
+        supervisor_log.removeHandler(handler)
+        driver_log.removeHandler(handler)
+
+    assert records == []
+
+
+async def test_startup_stays_alive_if_the_schema_disappears_at_runtime(tmp_path) -> None:
+    """The supervisor's job, exercised in situ rather than only in
+    `test_supervisor.py`: a database that breaks *after* startup degrades to
+    "prices stop updating", not "the app falls over"."""
+    db_path = str(tmp_path / "finally.db")
+    app = create_app(_settings(db_path))
+
+    async with running_app(app) as client:
+        cache: PriceCache = app.state.price_cache
+        assert await _wait_until(lambda: len(cache.snapshot()) == len(DEFAULT_WATCHLIST))
+
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("DROP TABLE watchlist")
+            await db.commit()
+
+        await asyncio.sleep(0.2)  # several driver cycles against a broken DB
+        assert (await client.get("/api/health")).status_code == 200
+
+
+async def test_health_endpoint_reports_ok(tmp_path) -> None:
+    app = create_app(_settings(str(tmp_path / "finally.db")))
+
+    async with running_app(app) as client:
+        response = await client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+async def test_health_endpoint_is_registered(tmp_path) -> None:
+    app = create_app(_settings(str(tmp_path / "finally.db")))
+
+    assert "/api/health" in _route_paths(app)
 
 
 # ── Lifespan shutdown ────────────────────────────────────────────────────
@@ -205,7 +259,7 @@ async def test_shutdown_cancels_the_driver_task(seeded_db: str) -> None:
 
     async with running_app(app):
         cache: PriceCache = app.state.price_cache
-        assert await _wait_until(lambda: len(cache.snapshot()) == 2)
+        assert await _wait_until(lambda: len(cache.snapshot()) == len(DEFAULT_WATCHLIST))
 
     # No market_data task is left running after the app shuts down.
     remaining = [t for t in asyncio.all_tasks() if t.get_name() == "market_data" and not t.done()]
