@@ -1,0 +1,70 @@
+# FinAlly E2E stack — the app container plus a Playwright container.
+#
+# Keeping the browser out of the production image is deliberate (PLAN.md §12):
+# the shipped image stays small, and the tests drive the real artifact users run.
+#
+#   Run:      npm run test:docker
+#   Clean up: npm run test:docker:down
+#
+# The database is a tmpfs, so EVERY RUN STARTS FROM THE SEEDED DEFAULT STATE —
+# 10 watchlist tickers, $10,000 cash — with no volume to remember and no volume
+# to clean up. This is the property the whole suite's determinism rests on.
+
+name: finally-e2e
+
+services:
+  app:
+    image: ${FINALLY_IMAGE:-finally:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      # Deterministic, free, offline LLM responses (PLAN.md §9, contract §6.1).
+      LLM_MOCK: "true"
+      # Explicitly empty: chat must never reach OpenRouter from a test run, and
+      # an empty MASSIVE_API_KEY selects the built-in simulator (PLAN.md §5).
+      OPENROUTER_API_KEY: ""
+      MASSIVE_API_KEY: ""
+      DB_PATH: /app/db/finally.db
+    # No env_file — a test run must never inherit a developer's real .env.
+    tmpfs:
+      - /app/db
+    ports:
+      # Published only so a failing run can be poked at by hand. If port 8000 is
+      # already taken on your machine, set E2E_APP_PORT=8001.
+      - "${E2E_APP_PORT:-8000}:8000"
+    healthcheck:
+      # python rather than curl: the runtime stage is python:3.12-slim, which
+      # ships no curl or wget.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status == 200 else 1)"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: "no"
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.56.1-noble
+    depends_on:
+      app:
+        condition: service_healthy
+    working_dir: /work
+    environment:
+      E2E_BASE_URL: http://app:8000
+      CI: "1"
+    volumes:
+      - ./:/work
+      # Keep the host's node_modules (Windows/macOS binaries) out of the Linux
+      # container, and vice versa.
+      - playwright-node-modules:/work/node_modules
+    # Chromium crashes with the default 64MB /dev/shm in a container.
+    ipc: host
+    command: sh -c "npm ci --no-audit --no-fund && npx playwright test"
+    restart: "no"
+
+volumes:
+  playwright-node-modules:

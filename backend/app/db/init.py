@@ -38,7 +38,11 @@ DEFAULT_WATCHLIST = (
 )
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
+    """The one timestamp format written to the database: ISO-8601 UTC *with*
+    offset (`API_CONTRACT.md` §2). Every repository writes through this so
+    stored timestamps sort lexicographically — the snapshot window and the
+    chat history both rely on string comparison in SQL."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -88,7 +92,7 @@ async def _is_fresh(db: aiosqlite.Connection, user_id: str) -> bool:
 
 
 async def _seed(db: aiosqlite.Connection, user_id: str) -> None:
-    now = _utc_now_iso()
+    now = utc_now_iso()
 
     await db.execute(
         "INSERT OR IGNORE INTO users_profile (id, cash_balance, created_at) VALUES (?, ?, ?)",

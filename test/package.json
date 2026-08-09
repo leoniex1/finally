@@ -1,0 +1,24 @@
+{
+  "name": "finally-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright end-to-end suite for the FinAlly trading workstation",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:harness": "playwright test --grep @harness",
+    "test:app": "playwright test --grep @app",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:docker": "docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from playwright",
+    "test:docker:down": "docker compose -f docker-compose.test.yml down -v --remove-orphans",
+    "typecheck": "tsc --noEmit",
+    "report": "playwright show-report",
+    "install:browsers": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,9 @@
+# Local-development SQLite location (PLAN.md §4, §11).
+#
+# When the backend runs directly on the host, DB_PATH defaults to
+# db/finally.db and the file lands here. Under Docker the database lives at
+# /app/db inside the container, backed by the named volume `finally-data` —
+# nothing appears in this directory in that case.
+#
+# This file only keeps the directory present in the repo. The .db files are
+# gitignored.

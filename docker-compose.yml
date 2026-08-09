@@ -1,0 +1,33 @@
+# Convenience wrapper around the same container the start scripts run
+# (PLAN.md §11). Equivalent to:
+#
+#   docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+#
+#   docker compose up --build -d      start (build if needed)
+#   docker compose down               stop; the volume and its data survive
+#   docker compose down -v            stop and discard the database
+#
+# Requires a `.env` in this directory — `cp .env.example .env` first.
+
+services:
+  app:
+    build:
+      context: .
+    image: finally:latest
+    container_name: finally
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - finally-data:/app/db
+    restart: unless-stopped
+
+volumes:
+  finally-data:
+    # `name:` pins the real volume name. Without it Compose would create
+    # `<project>_finally-data`, a *different* database from the one the start
+    # scripts and the documented `docker run` use — the "my trades
+    # disappeared" trap PLAN.md §11 calls out. Every entry point resolves to
+    # this one volume.
+    name: finally-data

@@ -1,0 +1,59 @@
+# Keep the build context small and reproducible. Anything generated on the
+# host must not leak into the image — it is rebuilt inside the Dockerfile.
+
+# Version control & CI
+.git
+.gitignore
+.github
+
+# Secrets: values reach the container through --env-file / env_file at run
+# time (PLAN.md §5). There is deliberately no .env inside the image.
+.env
+.env.*
+!.env.example
+
+# Node / frontend build artifacts
+**/node_modules
+frontend/.next
+frontend/out
+frontend/.turbo
+npm-debug.log*
+yarn-error.log*
+
+# Python build artifacts & virtualenvs
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+**/*.egg-info
+
+# Local SQLite database — the container gets its own via the named volume
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Not needed at runtime
+planning
+test
+scripts
+backend/tests
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+README.md
+LICENSE
+CLAUDE.md
+.claude
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db

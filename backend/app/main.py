@@ -14,7 +14,10 @@ from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI
 
+from .api.routes import chat as chat_routes
 from .api.routes import market_data as market_data_routes
+from .api.routes import portfolio as portfolio_routes
+from .api.routes import watchlist as watchlist_routes
 from .config import Settings
 from .db.init import init_db
 from .market_data.cache import PriceCache
@@ -22,6 +25,8 @@ from .market_data.driver import run_market_data_loop
 from .market_data.factory import build_market_data_provider
 from .market_data.supervisor import run_supervised
 from .market_data.tracked_set import TrackedSetProvider
+from .portfolio.snapshot_task import run_snapshot_loop
+from .static_files import mount_static
 
 logger = logging.getLogger("app.main")
 
@@ -37,6 +42,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     # the lifespan has run gets an empty cache rather than an AttributeError.
     app.state.price_cache = PriceCache()
     app.include_router(market_data_routes.router)
+    app.include_router(portfolio_routes.router)
+    app.include_router(watchlist_routes.router)
+    app.include_router(chat_routes.router)
 
     @app.get("/api/health")
     async def health() -> dict:
@@ -49,6 +57,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         the supervisor is already designed to ride out.
         """
         return {"status": "ok"}
+
+    # Last, unconditionally: `mount_static` installs a `/{full_path:path}`
+    # catch-all, and FastAPI matches routes in registration order. Registered
+    # any earlier it would swallow every `/api` route below it — including
+    # the health check directly above — and serve them `index.html` with a
+    # `200`, which is the kind of failure that looks like a frontend routing
+    # bug for an hour before anyone suspects the mount order.
+    mount_static(app, resolved.static_dir)
 
     return app
 
@@ -98,8 +114,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
             name="market_data",
         ),
-        # The portfolio-snapshot task (`PLAN.md` §7) is wired the same way
-        # here once the portfolio module lands.
+        asyncio.create_task(
+            run_supervised(
+                "portfolio_snapshots",
+                lambda: run_snapshot_loop(settings.db_path, cache),
+            ),
+            name="portfolio_snapshots",
+        ),
     ]
 
     try:

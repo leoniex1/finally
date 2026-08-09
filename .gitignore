@@ -205,3 +205,25 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── FinAlly ──────────────────────────────────────────────────────────────────
+# Local-dev SQLite database (PLAN.md §4). The directory is kept by db/.gitkeep;
+# the database itself is never committed. Under Docker the data lives in the
+# named volume `finally-data` instead.
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Node / Next.js
+node_modules/
+.next/
+frontend/out/
+.turbo/
+npm-debug.log*
+yarn-error.log*
+
+# Playwright
+test/test-results/
+test/playwright-report/
+test/node_modules/
